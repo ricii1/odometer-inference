@@ -120,6 +120,29 @@ async def inference_base64(payload: Base64InferenceRequest):
 async def health():
     return {"status": "ok" if model_loaded else "loading", "device": DEVICE}
 
+@app.post("/inference/upload/false/")
+async def inference_false(file: UploadFile = File(...)):
+    """Dummy endpoint for testing false response"""
+    # Read file content even if not used
+    file_content = await file.read()
+    
+    # Validate with proper tuple syntax
+    validate_image_content(file_content)
+    
+    return {
+        "mileage": None, 
+        "engineType": "JBK1E", 
+        "keterangan": "Foto tidak valid: objek speedometer tidak terlihat jelas atau tidak sesuai"
+    }
+
+@app.post("/inference/base64/false/")
+def inference_base64_false(file: str):
+    return {
+        "mileage": None, 
+        "engineType": "JBK1E", 
+        "keterangan": "Foto tidak valid: objek speedometer tidak terlihat jelas atau tidak sesuai"
+    }
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
