@@ -1,152 +1,124 @@
 import base64
 import logging
-from typing import Optional
-
-from fastapi import FastAPI, HTTPException, UploadFile, File, BackgroundTasks
+import io
+import json
+import re
+import torch
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
 from pydantic import BaseModel
-import magic
+from PIL import Image
+from transformers import AutoModelForVision2Seq, AutoProcessor
+from peft import PeftModel
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Honda Odometer Inference API", version="1.0.0")
+app = FastAPI(title="Qwen3-VL Inference Engine", version="1.2.0")
 
-# Constants
-ALLOWED_MIME_TYPES = {"image/jpeg", "image/png"}
-MAX_FILE_SIZE = 1 * 1024 * 1024  # 10MB
+# --- CONFIGURATION ---
+BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
+LORA_ADAPTER_PATH = "./checkpoint-1500" 
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# Global state for model
+model = None
+processor = None
 model_loaded = False
 
-def validate_image_content(file_content: bytes) -> None:
-    """Validate image content using magic bytes"""
-    if len(file_content) > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum size is {MAX_FILE_SIZE / 1024 / 1024}MB"
+@app.on_event("startup")
+async def load_model_on_startup():
+    global model, processor, model_loaded
+    try:
+        logger.info(f"Loading {BASE_MODEL_ID}...")
+        processor = AutoProcessor.from_pretrained(BASE_MODEL_ID, trust_remote_code=True)
+        base_model = AutoModelForVision2Seq.from_pretrained(
+            BASE_MODEL_ID,
+            torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
+            device_map="auto",
+            trust_remote_code=True
         )
-    
-    mime = magic.from_buffer(file_content, mime=True)
-    if mime not in ALLOWED_MIME_TYPES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Invalid file type. Detected: {mime}. Allowed: {', '.join(ALLOWED_MIME_TYPES)}"
-        )
+        # Load your fine-tuned weights
+        model = PeftModel.from_pretrained(base_model, LORA_ADAPTER_PATH)
+        model.eval()
+        model_loaded = True
+        logger.info("Model and Adapter loaded successfully.")
+    except Exception as e:
+        logger.error(f"Failed to load model: {str(e)}")
 
-class InferenceRequest(BaseModel):
-    file: str
+# --- HELPER: JSON EXTRACTION ---
+def extract_json(text: str) -> Dict[str, Any]:
+    try:
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        return {"raw_output": text}
+    except Exception:
+        return {"raw_output": text}
+
+# --- INFERENCE CORE ---
+def run_qwen3_inference(image_bytes: bytes, user_prompt: str) -> Dict[str, Any]:
+    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": user_prompt},
+            ],
+        }
+    ]
+
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = processor(text=[text], images=[image], padding=True, return_tensors="pt").to(DEVICE)
+
+    with torch.no_grad():
+        generated_ids = model.generate(**inputs, max_new_tokens=512)
+        generated_ids_trimmed = [
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+        ]
+        response_text = processor.batch_decode(
+            generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
+        )[0]
+    
+    # If the user asked for JSON in their prompt, we try to parse it
+    if "json" in user_prompt.lower():
+        return extract_json(response_text)
+    return {"response": response_text}
+
+# --- ENDPOINTS ---
+class Base64InferenceRequest(BaseModel):
+    file: str  # base64 string
+    prompt: str
 
 @app.post("/inference/upload/")
-async def inference(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Upload image file for odometer inference"""
-    try:
-        # Read file content
-        file_content = await file.read()
-        
-        # Validate image content
-        validate_image_content(file_content)
-        
-        # TODO: Replace with actual ML model inference
-        logger.info(f"Processing file: {file.filename}, size: {len(file_content)} bytes")
-        
-        # Log in background
-        background_tasks.add_task(logger.info, f"Completed processing: {file.filename}")
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error processing file {file.filename}: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error during image processing"
-        )
+async def inference_upload(
+    file: UploadFile = File(...), 
+    prompt: str = Form("Extract mileage and engine type in JSON format.")
+):
+    """Takes a file and a prompt via Form data."""
+    if not model_loaded:
+        raise HTTPException(status_code=503, detail="Model starting up...")
     
-    return {
-        "mileage": 472, 
-        "engineType": "EF32E", 
-        "keterangan": "Foto valid: objek speedometer terlihat jelas dan sesuai"
-    }
+    content = await file.read()
+    return run_qwen3_inference(content, prompt)
 
 @app.post("/inference/base64/")
-async def inference_base64(background_tasks: BackgroundTasks, payload: InferenceRequest):
-    """Submit base64 encoded image for odometer inference"""
-    try:
-        # Decode base64
-        try:
-            image_bytes = base64.b64decode(payload.file)
-        except Exception:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid base64 encoding"
-            )
-        
-        # Validate image content
-        validate_image_content(image_bytes)
-        
-        # TODO: Replace with actual ML model inference
-        logger.info(f"Processing base64 image, size: {len(image_bytes)} bytes")
-        
-        # Log in background
-        background_tasks.add_task(logger.info, "Completed processing base64 image")
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error processing base64 image: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Internal server error during image processing"
-        )
+async def inference_base64(payload: Base64InferenceRequest):
+    """Takes a JSON payload with a base64 image and a prompt."""
+    if not model_loaded:
+        raise HTTPException(status_code=503, detail="Model starting up...")
     
-    return {
-        "mileage": 472, 
-        "engineType": "EF32E", 
-        "keterangan": "Foto valid: objek speedometer terlihat jelas dan sesuai"
-    }
-
-@app.get("/")
-async def read_root():
-    """Root endpoint"""
-    return {"message": "Inference API odometer mpm honda"}
+    try:
+        image_bytes = base64.b64decode(payload.file)
+        return run_qwen3_inference(image_bytes, payload.prompt)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint with actual status"""
-    global model_loaded
-    
-    # TODO: Add actual model health check
-    # For now, assume model is loaded if service is running
-    model_loaded = True
-    
-    return {
-        "status": "ok", 
-        "message": "Inference API is running smoothly",
-        "model_loaded": model_loaded
-    }
-
-@app.post("/inference/upload/false/")
-async def inference_false(file: UploadFile = File(...)):
-    """Dummy endpoint for testing false response"""
-    # Read file content even if not used
-    file_content = await file.read()
-    
-    # Validate with proper tuple syntax
-    validate_image_content(file_content)
-    
-    return {
-        "mileage": None, 
-        "engineType": "JBK1E", 
-        "keterangan": "Foto tidak valid: objek speedometer tidak terlihat jelas atau tidak sesuai"
-    }
-
-@app.post("/inference/base64/false/")
-def inference_base64_false(file: str):
-    return {
-        "mileage": None, 
-        "engineType": "JBK1E", 
-        "keterangan": "Foto tidak valid: objek speedometer tidak terlihat jelas atau tidak sesuai"
-    }
+async def health():
+    return {"status": "ok" if model_loaded else "loading", "device": DEVICE}
 
 if __name__ == "__main__":
     import uvicorn
