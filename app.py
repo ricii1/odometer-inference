@@ -57,9 +57,9 @@ def extract_json(text: str) -> Dict[str, Any]:
         return {"raw_output": text}
 
 # --- INFERENCE CORE ---
-def run_qwen3_inference(image_bytes: bytes, user_prompt: str) -> Dict[str, Any]:
+def run_qwen3_inference(image_bytes: bytes) -> Dict[str, Any]:
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    
+    user_prompt = "Ekstrak data mileage dan tipe mesin dari gambar speedometer motor ini. Format Output: JSON."
     messages = [
         {
             "role": "user",
@@ -90,19 +90,17 @@ def run_qwen3_inference(image_bytes: bytes, user_prompt: str) -> Dict[str, Any]:
 # --- ENDPOINTS ---
 class Base64InferenceRequest(BaseModel):
     file: str  # base64 string
-    prompt: str
 
 @app.post("/inference/upload/")
 async def inference_upload(
     file: UploadFile = File(...), 
-    prompt: str = Form("Extract mileage and engine type in JSON format.")
 ):
     """Takes a file and a prompt via Form data."""
     if not model_loaded:
         raise HTTPException(status_code=503, detail="Model starting up...")
     
     content = await file.read()
-    return run_qwen3_inference(content, prompt)
+    return run_qwen3_inference(content)
 
 @app.post("/inference/base64/")
 async def inference_base64(payload: Base64InferenceRequest):
@@ -112,7 +110,7 @@ async def inference_base64(payload: Base64InferenceRequest):
     
     try:
         image_bytes = base64.b64decode(payload.file)
-        return run_qwen3_inference(image_bytes, payload.prompt)
+        return run_qwen3_inference(image_bytes)
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 

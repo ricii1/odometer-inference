@@ -6,7 +6,6 @@ with open("./odometer_images/5.jpg", "rb") as f:
 
 payload = {
     "file": img_str,
-    "prompt": "Ekstrak data mileage dan tipe mesin dari gambar speedometer motor ini. Format Output: JSON."
 }
 
 response = requests.post("http://localhost:8000/inference/base64/", json=payload)
