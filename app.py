@@ -19,7 +19,7 @@ app = FastAPI(title="Qwen3-VL Inference Engine", version="1.2.0")
 
 # --- CONFIGURATION ---
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
-LORA_ADAPTER_PATH = "./checkpoint-1500" 
+LORA_ADAPTER_PATH = "./lora-model" 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 model = None
@@ -143,4 +143,4 @@ def inference_base64_false(file: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8002)
