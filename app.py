@@ -1,238 +1,226 @@
+"""
+FastAPI Application with subprocess-based model loading.
+Model runs in a separate process that can be killed to completely free VRAM.
+"""
 import base64
-import gc
+import json
 import logging
 import io
-import json
-import re
+import os
+import subprocess
+import sys
 import threading
 import time
-import torch
+from pathlib import Path
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, BackgroundTasks
+from contextlib import asynccontextmanager
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from PIL import Image
-from transformers import AutoModelForVision2Seq, AutoProcessor
-from peft import PeftModel
-from contextlib import asynccontextmanager
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION ---
-BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
-LORA_ADAPTER_PATH = "./lora-model"
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-IDLE_TIMEOUT_SECONDS = 10  # Unload model setelah 5 menit idle
+# Configuration
+IDLE_TIMEOUT_SECONDS = 300  # Kill worker process after 5 minutes idle
+SCRIPT_DIR = Path(__file__).parent.resolve()
+WORKER_SCRIPT = SCRIPT_DIR / "model_worker.py"
 
-# --- MODEL MANAGER ---
-class ModelManager:
-    """Manages lazy loading and unloading of the model to save VRAM."""
+
+class WorkerManager:
+    """Manages the model worker subprocess."""
     
     def __init__(self):
-        self.model = None
-        self.processor = None
+        self.process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._last_used = 0.0
-        self._unload_timer: Optional[threading.Timer] = None
-        self._models_downloaded = False
+        self._idle_timer: Optional[threading.Timer] = None
+        self._worker_ready = False
     
-    def predownload_models(self) -> bool:
-        """Pre-download models to cache without loading to GPU."""
-        try:
-            logger.info(f"Pre-downloading {BASE_MODEL_ID} to cache...")
-            # Download processor (lightweight, keep in memory)
-            self.processor = AutoProcessor.from_pretrained(
-                BASE_MODEL_ID, 
-                trust_remote_code=True
-            )
-            
-            # Download model weights to cache only (don't load to GPU)
-            # This downloads the files but doesn't allocate VRAM
-            from huggingface_hub import snapshot_download
-            snapshot_download(
-                repo_id=BASE_MODEL_ID,
-                ignore_patterns=["*.md", "*.txt"],
-            )
-            
-            self._models_downloaded = True
-            logger.info("Models pre-downloaded to cache successfully.")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to pre-download models: {str(e)}")
-            return False
+    def is_running(self) -> bool:
+        """Check if worker process is running."""
+        return self.process is not None and self.process.poll() is None
     
-    def is_loaded(self) -> bool:
-        """Check if model is loaded in memory."""
-        return self.model is not None
-    
-    def load_model(self) -> bool:
-        """Load model to GPU. Returns True if successful."""
+    def start_worker(self) -> bool:
+        """Start the worker subprocess."""
         with self._lock:
-            if self.model is not None:
+            if self.is_running():
                 self._update_last_used()
                 return True
             
             try:
-                logger.info(f"Loading {BASE_MODEL_ID} to {DEVICE}...")
-                start_time = time.time()
-                
-                # Ensure processor is loaded
-                if self.processor is None:
-                    self.processor = AutoProcessor.from_pretrained(
-                        BASE_MODEL_ID, 
-                        trust_remote_code=True
-                    )
-                
-                # Load base model to GPU
-                base_model = AutoModelForVision2Seq.from_pretrained(
-                    BASE_MODEL_ID,
-                    torch_dtype=torch.float16 if DEVICE == "cuda" else torch.float32,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,  # Optimize memory during loading
+                logger.info(f"Starting model worker subprocess: {WORKER_SCRIPT}")
+                self.process = subprocess.Popen(
+                    [sys.executable, str(WORKER_SCRIPT)],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1,
+                    cwd=str(SCRIPT_DIR)  # Set working directory
                 )
                 
-                # Load LoRA adapter
-                self.model = PeftModel.from_pretrained(base_model, LORA_ADAPTER_PATH)
-                self.model.eval()
-                
-                load_time = time.time() - start_time
-                logger.info(f"Model loaded successfully in {load_time:.2f}s")
-                
-                self._update_last_used()
-                self._schedule_unload()
-                return True
-                
+                # Wait for ready signal with better error handling
+                response = self._read_response(timeout=300)  # 5 min timeout for loading
+                if response and response.get("status") == "ready":
+                    self._worker_ready = True
+                    logger.info("Worker subprocess started and ready.")
+                    self._update_last_used()
+                    self._schedule_idle_check()
+                    return True
+                else:
+                    # Read stderr for debugging
+                    stderr_output = ""
+                    if self.process and self.process.stderr:
+                        try:
+                            import select
+                            if select.select([self.process.stderr], [], [], 1)[0]:
+                                stderr_output = self.process.stderr.read(4096)
+                        except Exception:
+                            pass
+                    logger.error(f"Worker did not respond with ready: {response}")
+                    if stderr_output:
+                        logger.error(f"Worker stderr: {stderr_output}")
+                    self.stop_worker()
+                    return False
+                    
             except Exception as e:
-                logger.error(f"Failed to load model: {str(e)}")
-                self.model = None
+                logger.error(f"Failed to start worker: {str(e)}")
+                self.stop_worker()
                 return False
     
-    def unload_model(self):
-        """Unload model from GPU to free VRAM."""
+    def stop_worker(self):
+        """Stop the worker subprocess to free VRAM."""
         with self._lock:
-            if self.model is None:
-                return
+            if self._idle_timer:
+                self._idle_timer.cancel()
+                self._idle_timer = None
             
-            logger.info("Unloading model from GPU...")
-            
-            # Cancel any pending unload timer
-            if self._unload_timer is not None:
-                self._unload_timer.cancel()
-                self._unload_timer = None
-            
-            # Delete model and clear GPU memory
-            del self.model
-            self.model = None
-            
-            if DEVICE == "cuda":
-                torch.cuda.empty_cache()
-                gc.collect()
-            
-            logger.info("Model unloaded, VRAM freed.")
+            if self.process is not None:
+                logger.info("Stopping worker subprocess...")
+                try:
+                    # Send exit command
+                    self._send_command({"action": "exit"})
+                    self.process.wait(timeout=5)
+                except Exception:
+                    pass
+                
+                # Force kill if still running
+                if self.process.poll() is None:
+                    logger.info("Force killing worker...")
+                    self.process.kill()
+                    self.process.wait()
+                
+                self.process = None
+                self._worker_ready = False
+                logger.info("Worker stopped, VRAM should be completely freed.")
+    
+    def _send_command(self, command: dict):
+        """Send command to worker."""
+        if self.process and self.process.stdin:
+            try:
+                self.process.stdin.write(json.dumps(command) + "\n")
+                self.process.stdin.flush()
+            except Exception as e:
+                logger.error(f"Failed to send command: {e}")
+                raise
+    
+    def _read_response(self, timeout: float = 120) -> Optional[dict]:
+        """Read response from worker with timeout."""
+        if not self.process or not self.process.stdout:
+            return None
+        
+        import select
+        
+        # Use select for timeout on Linux
+        ready, _, _ = select.select([self.process.stdout], [], [], timeout)
+        if ready:
+            try:
+                line = self.process.stdout.readline()
+                if line:
+                    return json.loads(line.strip())
+            except Exception as e:
+                logger.error(f"Failed to read response: {e}")
+        return None
     
     def _update_last_used(self):
         """Update last used timestamp."""
         self._last_used = time.time()
     
-    def _schedule_unload(self):
-        """Schedule automatic unload after idle timeout."""
-        if self._unload_timer is not None:
-            self._unload_timer.cancel()
+    def _schedule_idle_check(self):
+        """Schedule idle check."""
+        if self._idle_timer:
+            self._idle_timer.cancel()
         
-        def check_and_unload():
-            elapsed = time.time() - self._last_used
-            if elapsed >= IDLE_TIMEOUT_SECONDS and self.model is not None:
-                logger.info(f"Model idle for {elapsed:.0f}s, unloading...")
-                self.unload_model()
+        def check_idle():
+            if time.time() - self._last_used >= IDLE_TIMEOUT_SECONDS:
+                logger.info(f"Worker idle for {IDLE_TIMEOUT_SECONDS}s, stopping...")
+                self.stop_worker()
+            elif self.is_running():
+                self._schedule_idle_check()
         
-        self._unload_timer = threading.Timer(IDLE_TIMEOUT_SECONDS + 1, check_and_unload)
-        self._unload_timer.daemon = True
-        self._unload_timer.start()
+        self._idle_timer = threading.Timer(IDLE_TIMEOUT_SECONDS, check_idle)
+        self._idle_timer.daemon = True
+        self._idle_timer.start()
     
     def run_inference(self, image_bytes: bytes) -> Dict[str, Any]:
-        """Run inference, loading model if needed."""
-        # Ensure model is loaded
-        if not self.load_model():
-            raise RuntimeError("Failed to load model")
+        """Run inference via worker subprocess."""
+        # Ensure worker is running
+        if not self.is_running():
+            if not self.start_worker():
+                raise RuntimeError("Failed to start worker process")
         
-        try:
-            image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            user_prompt = "Ekstrak data mileage dan tipe mesin dari gambar speedometer motor ini. Format Output: JSON."
-            messages = [
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "image", "image": image},
-                        {"type": "text", "text": user_prompt},
-                    ],
-                }
-            ]
-
-            text = self.processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            inputs = self.processor(
-                text=[text], images=[image], padding=True, return_tensors="pt"
-            ).to(DEVICE)
-
-            with torch.no_grad():
-                generated_ids = self.model.generate(**inputs, max_new_tokens=512)
-                generated_ids_trimmed = [
-                    out_ids[len(in_ids):] 
-                    for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
-                ]
-                response_text = self.processor.batch_decode(
-                    generated_ids_trimmed, 
-                    skip_special_tokens=True, 
-                    clean_up_tokenization_spaces=False
-                )[0]
-            
-            # Update last used and reschedule unload
-            self._update_last_used()
-            self._schedule_unload()
-            
-            # Parse JSON response
-            if "json" in user_prompt.lower():
-                return extract_json(response_text)
-            return {"response": response_text}
-            
-        except Exception as e:
-            logger.error(f"Inference error: {str(e)}")
-            raise
-
-# Global model manager instance
-model_manager = ModelManager()
+        with self._lock:
+            try:
+                # Send inference command
+                image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+                self._send_command({
+                    "action": "inference",
+                    "image": image_b64
+                })
+                
+                # Wait for response (up to 2 minutes for inference)
+                response = self._read_response(timeout=120)
+                
+                if response is None:
+                    raise RuntimeError("No response from worker")
+                
+                if response.get("status") == "success":
+                    self._update_last_used()
+                    self._schedule_idle_check()
+                    return response.get("result", {})
+                elif response.get("status") == "error":
+                    raise RuntimeError(response.get("message", "Unknown error"))
+                else:
+                    raise RuntimeError(f"Unexpected response: {response}")
+                    
+            except Exception as e:
+                logger.error(f"Inference error: {str(e)}")
+                # Worker might be dead, stop it
+                self.stop_worker()
+                raise
 
 
-# --- LIFESPAN CONTEXT ---
+# Global worker manager
+worker_manager = WorkerManager()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup and shutdown events."""
-    # Startup: Pre-download models to cache
-    model_manager.predownload_models()
+    logger.info("Application starting...")
     yield
-    # Shutdown: Unload model to free resources
-    model_manager.unload_model()
+    # Shutdown: stop worker to free resources
+    worker_manager.stop_worker()
 
 
 app = FastAPI(
-    title="Qwen3-VL Inference Engine", 
-    version="1.3.0",
+    title="Qwen3-VL Inference Engine",
+    version="2.0.0",
     lifespan=lifespan
 )
-
-
-# --- HELPER: JSON EXTRACTION ---
-def extract_json(text: str) -> Dict[str, Any]:
-    try:
-        match = re.search(r'\{.*\}', text, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        return {"raw_output": text}
-    except Exception:
-        return {"raw_output": text}
 
 
 # --- HELPER: VALIDATE IMAGE ---
@@ -255,7 +243,7 @@ async def inference_upload(file: UploadFile = File(...)):
     """Takes a file via Form data and runs inference."""
     try:
         content = await file.read()
-        return model_manager.run_inference(content)
+        return worker_manager.run_inference(content)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -268,7 +256,7 @@ async def inference_base64(payload: Base64InferenceRequest):
     """Takes a JSON payload with a base64 image and runs inference."""
     try:
         image_bytes = base64.b64decode(payload.file)
-        return model_manager.run_inference(image_bytes)
+        return worker_manager.run_inference(image_bytes)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -278,33 +266,31 @@ async def inference_base64(payload: Base64InferenceRequest):
 
 @app.get("/health")
 async def health():
-    """Health check endpoint with model status."""
+    """Health check endpoint with worker status."""
     return {
         "status": "ok",
-        "device": DEVICE,
-        "model_loaded": model_manager.is_loaded(),
-        "models_cached": model_manager._models_downloaded
+        "worker_running": worker_manager.is_running()
     }
 
 
 @app.post("/model/load")
 async def manual_load_model():
-    """Manually trigger model loading to GPU."""
+    """Manually start worker and load model."""
     try:
-        success = model_manager.load_model()
+        success = worker_manager.start_worker()
         if success:
-            return {"status": "Model loaded successfully"}
-        raise HTTPException(status_code=503, detail="Failed to load model")
+            return {"status": "Worker started and model loaded"}
+        raise HTTPException(status_code=503, detail="Failed to start worker")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/model/unload")
 async def manual_unload_model():
-    """Manually trigger model unloading from GPU."""
+    """Manually stop worker to free VRAM completely."""
     try:
-        model_manager.unload_model()
-        return {"status": "Model unloaded, VRAM freed"}
+        worker_manager.stop_worker()
+        return {"status": "Worker stopped, VRAM freed completely"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
