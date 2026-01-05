@@ -22,7 +22,9 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-IDLE_TIMEOUT_SECONDS = 10  # Kill worker process after 5 minutes idle
+IDLE_TIMEOUT_SECONDS = 300  # Kill worker process after 5 minutes idle
+SCRIPT_DIR = Path(__file__).parent.resolve()
+WORKER_SCRIPT = SCRIPT_DIR / "model_worker.py"
 
 
 class WorkerManager:
@@ -34,6 +36,18 @@ class WorkerManager:
         self._last_used = 0.0
         self._idle_timer: Optional[threading.Timer] = None
         self._worker_ready = False
+        self._stderr_thread: Optional[threading.Thread] = None
+    
+    def _stream_stderr(self):
+        """Background thread to stream stderr from worker to logger."""
+        if self.process and self.process.stderr:
+            try:
+                for line in self.process.stderr:
+                    line = line.strip()
+                    if line:
+                        logger.info(f"[Worker] {line}")
+            except Exception:
+                pass
     
     def is_running(self) -> bool:
         """Check if worker process is running."""
@@ -47,17 +61,25 @@ class WorkerManager:
                 return True
             
             try:
-                logger.info("Starting model worker subprocess...")
+                logger.info(f"Starting model worker subprocess: {WORKER_SCRIPT}")
                 self.process = subprocess.Popen(
-                    [sys.executable, "model_worker.py"],
+                    [sys.executable, str(WORKER_SCRIPT)],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    bufsize=1
+                    bufsize=1,
+                    cwd=str(SCRIPT_DIR)  # Set working directory
                 )
                 
-                # Wait for ready signal
+                # Start stderr streaming thread
+                self._stderr_thread = threading.Thread(
+                    target=self._stream_stderr,
+                    daemon=True
+                )
+                self._stderr_thread.start()
+                
+                # Wait for ready signal with better error handling
                 response = self._read_response(timeout=300)  # 5 min timeout for loading
                 if response and response.get("status") == "ready":
                     self._worker_ready = True
