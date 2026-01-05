@@ -6,12 +6,10 @@ import base64
 import json
 import logging
 import io
-import os
 import subprocess
 import sys
 import threading
 import time
-from pathlib import Path
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
@@ -24,9 +22,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Configuration
-IDLE_TIMEOUT_SECONDS = 300  # Kill worker process after 5 minutes idle
-SCRIPT_DIR = Path(__file__).parent.resolve()
-WORKER_SCRIPT = SCRIPT_DIR / "model_worker.py"
+IDLE_TIMEOUT_SECONDS = 10  # Kill worker process after 5 minutes idle
 
 
 class WorkerManager:
@@ -51,18 +47,17 @@ class WorkerManager:
                 return True
             
             try:
-                logger.info(f"Starting model worker subprocess: {WORKER_SCRIPT}")
+                logger.info("Starting model worker subprocess...")
                 self.process = subprocess.Popen(
-                    [sys.executable, str(WORKER_SCRIPT)],
+                    [sys.executable, "model_worker.py"],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
-                    bufsize=1,
-                    cwd=str(SCRIPT_DIR)  # Set working directory
+                    bufsize=1
                 )
                 
-                # Wait for ready signal with better error handling
+                # Wait for ready signal
                 response = self._read_response(timeout=300)  # 5 min timeout for loading
                 if response and response.get("status") == "ready":
                     self._worker_ready = True
@@ -71,18 +66,7 @@ class WorkerManager:
                     self._schedule_idle_check()
                     return True
                 else:
-                    # Read stderr for debugging
-                    stderr_output = ""
-                    if self.process and self.process.stderr:
-                        try:
-                            import select
-                            if select.select([self.process.stderr], [], [], 1)[0]:
-                                stderr_output = self.process.stderr.read(4096)
-                        except Exception:
-                            pass
                     logger.error(f"Worker did not respond with ready: {response}")
-                    if stderr_output:
-                        logger.error(f"Worker stderr: {stderr_output}")
                     self.stop_worker()
                     return False
                     
