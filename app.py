@@ -16,6 +16,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from pydantic import BaseModel
 from PIL import Image
+from pathlib import Path
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -171,7 +172,7 @@ class WorkerManager:
         self._idle_timer.daemon = True
         self._idle_timer.start()
     
-    def run_inference(self, image_bytes: bytes) -> Dict[str, Any]:
+    def run_inference(self, image_bytes: bytes, engine_type: str) -> Dict[str, Any]:
         """Run inference via worker subprocess."""
         # Ensure worker is running
         if not self.is_running():
@@ -184,7 +185,8 @@ class WorkerManager:
                 image_b64 = base64.b64encode(image_bytes).decode("utf-8")
                 self._send_command({
                     "action": "inference",
-                    "image": image_b64
+                    "image": image_b64,
+                    "engine_type": engine_type
                 })
                 
                 # Wait for response (up to 2 minutes for inference)
@@ -242,14 +244,15 @@ def validate_image_content(content: bytes) -> bool:
 # --- ENDPOINTS ---
 class Base64InferenceRequest(BaseModel):
     file: str  # base64 string
+    engineType: str  # engine type code for validation
 
 
 @app.post("/inference/upload/")
-async def inference_upload(file: UploadFile = File(...)):
+async def inference_upload(file: UploadFile = File(...), engineType: str = ""):
     """Takes a file via Form data and runs inference."""
     try:
         content = await file.read()
-        return worker_manager.run_inference(content)
+        return worker_manager.run_inference(content, engineType)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -262,7 +265,7 @@ async def inference_base64(payload: Base64InferenceRequest):
     """Takes a JSON payload with a base64 image and runs inference."""
     try:
         image_bytes = base64.b64decode(payload.file)
-        return worker_manager.run_inference(image_bytes)
+        return worker_manager.run_inference(image_bytes, payload.engineType)
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -302,23 +305,23 @@ async def manual_unload_model():
 
 
 @app.post("/inference/upload/false/")
-async def inference_false(file: UploadFile = File(...)):
+async def inference_false(file: UploadFile = File(...), engineType: str = ""):
     """Dummy endpoint for testing false response."""
     file_content = await file.read()
     validate_image_content(file_content)
     return {
         "mileage": None,
-        "engineType": "JBK1E",
+        "isEngineTypeCorrect": False,
         "keterangan": "Foto tidak valid: objek speedometer tidak terlihat jelas atau tidak sesuai"
     }
 
 
 @app.post("/inference/base64/false/")
-def inference_base64_false(file: str):
+def inference_base64_false(file: str, engineType: str = ""):
     """Dummy endpoint for testing false response with base64."""
     return {
         "mileage": None,
-        "engineType": "JBK1E",
+        "isEngineTypeCorrect": False,
         "keterangan": "Foto tidak valid: objek speedometer tidak terlihat jelas atau tidak sesuai"
     }
 

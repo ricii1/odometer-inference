@@ -9,10 +9,13 @@ import logging
 import re
 import sys
 import torch
+import pandas as pd
 from typing import Dict, Any
 from PIL import Image
 from transformers import AutoModelForVision2Seq, AutoProcessor
 from peft import PeftModel
+from qwen_vl_utils import process_vision_info
+from pathlib import Path
 
 # Setup logging
 logging.basicConfig(
@@ -25,6 +28,16 @@ logger = logging.getLogger(__name__)
 BASE_MODEL_ID = "Qwen/Qwen3-VL-8B-Instruct"
 LORA_ADAPTER_PATH = "./lora-model"
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+SCRIPT_DIR = Path(__file__).parent.resolve()
+ODOMETER_CSV_PATH = SCRIPT_DIR / "odometer-engine-type" / "kode-odometer.csv"
+
+# Prompt for comparing speedometer images
+ENGINE_TYPE_PROMPT = """
+Compare Image 1 and Image 2. 
+Focus strictly on the speedometer/odometer shape, dial layout, and markings.
+Are they the same model?
+Answer absolutely ONLY with 'TRUE' or 'FALSE'. Do not explain.
+"""
 
 
 def extract_json(text: str) -> Dict[str, Any]:
@@ -86,7 +99,76 @@ def load_model():
     return model, processor
 
 
-def run_inference(model, processor, image_bytes: bytes) -> Dict[str, Any]:
+def compare_speedometer_images(model, processor, image: Image.Image, engine_type: str) -> bool:
+    """Compare user's speedometer image with reference image based on engine type."""
+    import time
+    
+    try:
+        # Load odometer data
+        df_data = pd.read_csv(ODOMETER_CSV_PATH)
+        
+        # Find reference image for engine type
+        row = df_data[df_data['ENGINECODE'] == engine_type]
+        
+        if row.empty:
+            logger.warning(f"Engine code '{engine_type}' not found in database.")
+            return False
+        
+        reference_filename = row['SPEEDOMETERLINK'].values[0]
+        reference_path = str(SCRIPT_DIR / "odometer-engine-type" / reference_filename)
+        logger.info(f"Comparing with reference: {reference_path}")
+        
+        # Build messages for comparison
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "image": image},
+                    {"type": "image", "image": reference_path},
+                    {"type": "text", "text": ENGINE_TYPE_PROMPT},
+                ],
+            }
+        ]
+        
+        # Process and run inference
+        text = processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        
+        image_inputs, video_inputs = process_vision_info(messages)
+        
+        inputs = processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt",
+        ).to(DEVICE)
+        
+        with torch.no_grad():
+            generated_ids = model.generate(**inputs, max_new_tokens=10)
+            generated_ids_trimmed = [
+                out_ids[len(in_ids):]
+                for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            ]
+            output_text = processor.batch_decode(
+                generated_ids_trimmed,
+                skip_special_tokens=True,
+                clean_up_tokenization_spaces=False
+            )[0]
+        
+        logger.info(f"Comparison result: {output_text}")
+        
+        # Parse output to boolean
+        clean_output = output_text.strip().upper()
+        return "TRUE" in clean_output
+        
+    except Exception as e:
+        logger.error(f"Error comparing speedometer images: {str(e)}")
+        return False
+
+
+def run_inference(model, processor, image_bytes: bytes, engine_type: str) -> Dict[str, Any]:
     """Run inference on image with timing."""
     import time
     start_time = time.time()
@@ -131,13 +213,26 @@ def run_inference(model, processor, image_bytes: bytes) -> Dict[str, Any]:
         )[0]
     
     gen_time = time.time() - gen_start
-    total_time = time.time() - start_time
     logger.info(f"Generation completed in {gen_time:.2f}s")
-    logger.info(f"Total inference time: {total_time:.2f}s")
 
-    if "json" in user_prompt.lower():
-        return extract_json(response_text)
-    return {"response": response_text}
+    # Extract mileage and keterangan from JSON response
+    result = extract_json(response_text)
+    
+    # Compare speedometer images if engine_type is provided
+    is_engine_type_correct = False
+    if engine_type:
+        logger.info(f"Comparing speedometer for engine type: {engine_type}")
+        is_engine_type_correct = compare_speedometer_images(model, processor, image, engine_type)
+    
+    total_time = time.time() - start_time
+    logger.info(f"Total inference time: {total_time:.2f}s")
+    
+    # Build final response
+    return {
+        "mileage": result.get("mileage"),
+        "isEngineTypeCorrect": is_engine_type_correct,
+        "keterangan": result.get("keterangan", "")
+    }
 
 
 def main():
@@ -165,8 +260,9 @@ def main():
                     model, processor = load_model()
                 
                 image_b64 = command.get("image")
+                engine_type = command.get("engine_type", "")
                 image_bytes = base64.b64decode(image_b64)
-                result = run_inference(model, processor, image_bytes)
+                result = run_inference(model, processor, image_bytes, engine_type)
                 print(json.dumps({"status": "success", "result": result}), flush=True)
                 
             elif action == "health":
