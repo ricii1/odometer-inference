@@ -13,7 +13,7 @@ import time
 from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from pydantic import BaseModel
 from PIL import Image
 from pathlib import Path
@@ -248,7 +248,7 @@ class Base64InferenceRequest(BaseModel):
 
 
 @app.post("/inference/upload/")
-async def inference_upload(file: UploadFile = File(...), engineType: str = ""):
+async def inference_upload(file: UploadFile = File(...), engineType: str = Form("")):
     """Takes a file via Form data and runs inference."""
     try:
         content = await file.read()
@@ -305,7 +305,7 @@ async def manual_unload_model():
 
 
 @app.post("/inference/upload/false/")
-async def inference_false(file: UploadFile = File(...), engineType: str = ""):
+async def inference_false(file: UploadFile = File(...), engineType: str = Form("")):
     """Dummy endpoint for testing false response."""
     file_content = await file.read()
     validate_image_content(file_content)
