@@ -20,8 +20,8 @@ from pathlib import Path
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-    filemode="w"
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    filemode="w",
     filename="model_worker.log"
 )
 logger = logging.getLogger(__name__)
