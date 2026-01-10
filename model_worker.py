@@ -180,7 +180,18 @@ def run_inference(model, processor, image_bytes: bytes, engine_type: str) -> Dic
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
     logger.info(f"Image loaded: {image.size}")
     
-    user_prompt = "Ekstrak data mileage dan tipe mesin dari gambar speedometer motor ini. Format Output: JSON."
+    user_prompt = """Analisis gambar meter kendaraan dengan TELITI.
+1. Pastikan kendaraan adalah MOTOR dan foto adalah speedometer motor.
+2. Tentukan apakah meter dapat dibaca jelas. Pastikan meter tidak blur, terpotong, atau memiliki kekurangan visual lainnya yang memunculkan ambiguitas.
+3. ATURAN ANALOG: Ambil angka yang terlihat. JIKA TRANSISI (SETENGAH NAIK): Ambil digit yang lebih rendah. Jika terdapat digit terakhir yang berwarna berbeda, contohnya 1 digit putih di akhir dan semua digit lainnya hitam, abaikan digit paling terakhir.
+4. ATURAN DIGITAL: Baca angka persis.
+
+FORMAT OUTPUT (JSON SAJA):
+{
+  "mileage": float/int,
+  "engineType": "string",
+  "keterangan": "string"
+}"""
     
     messages = [
         {
