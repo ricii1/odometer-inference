@@ -14,6 +14,7 @@ from typing import Optional, Dict, Any
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi.middleware.cors import CORSMiddleware  # <--- IMPORTED HERE
 from pydantic import BaseModel
 from PIL import Image
 from pathlib import Path
@@ -229,6 +230,17 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan
 )
+
+# --- CORS MIDDLEWARE SETUP ---
+# Allows requests from any origin. Adjust allow_origins if you need stricter security.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+# -----------------------------
 
 
 # --- HELPER: VALIDATE IMAGE ---
